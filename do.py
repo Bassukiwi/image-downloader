@@ -27,6 +27,8 @@ SAVE_DIR = "downloaded_images"
 TARGET_CAW = 3840
 
 RewriteParameters = list[tuple[str, str]]
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".avif")
+NOTE_IMAGE_HOST = "assets.st-note.com"
 
 # 请求头
 HEADERS = {
@@ -138,6 +140,152 @@ def get_pixiv_original_urls(page_url: str) -> list[str]:
         return []
 
     return build_pixiv_original_urls(page_url, payload.get("body") or {})
+
+
+def _best_srcset_url(srcset: str) -> str | None:
+    """Return the largest candidate from a srcset value."""
+
+    candidates = []
+    for candidate in srcset.split(","):
+        parts = candidate.strip().split()
+        if not parts:
+            continue
+
+        descriptor = parts[1] if len(parts) > 1 else "0w"
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)(w|x)", descriptor)
+        score = float(match.group(1)) if match else 0
+        candidates.append((score, parts[0]))
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def upgrade_image_url(image_url: str) -> str:
+    """Use a site's original-image transformation when it is known."""
+
+    parsed = urlparse(image_url)
+    if parsed.netloc.lower() != NOTE_IMAGE_HOST or not parsed.path.startswith(
+        "/img/"
+    ):
+        return image_url
+
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(
+                [
+                    ("width", "4000"),
+                    ("height", "4000"),
+                    ("fit", "bounds"),
+                    ("format", "jpg"),
+                    ("quality", "90"),
+                ]
+            ),
+            parsed.fragment,
+        )
+    )
+
+
+def _image_identity(image_url: str) -> str:
+    """Identify same-file CDN variants without collapsing different images."""
+
+    parsed = urlparse(image_url)
+    if parsed.netloc.lower() == NOTE_IMAGE_HOST:
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+    return image_url
+
+
+def _image_quality_score(image_url: str) -> tuple[float, float, float]:
+    """Score known CDN variants by dimensions first, then quality."""
+
+    query = dict(parse_qsl(urlparse(image_url).query, keep_blank_values=True))
+
+    def number(name: str) -> float:
+        try:
+            return float(query.get(name, 0))
+        except ValueError:
+            return 0
+
+    width = number("width")
+    height = number("height")
+    quality = number("quality")
+    area = width * height if width and height else width or height
+    return max(width, height), area, quality
+
+
+def extract_image_sources(html: str, page_url: str) -> list[str]:
+    """Extract one best-quality image URL per HTML image element."""
+
+    soup = BeautifulSoup(html, "html.parser")
+    image_sources = []
+    source_indexes = {}
+
+    quality_attributes = (
+        "data-full",
+        "data-full-size",
+        "data-hires",
+        "data-highres",
+        "data-large",
+        "data-original",
+    )
+    fallback_attributes = ("data-src", "data-lazy-src", "src")
+
+    for image in soup.find_all("img"):
+        candidate = None
+
+        for attribute in quality_attributes:
+            value = image.get(attribute)
+            if isinstance(value, str) and value.strip():
+                candidate = value.strip()
+                break
+
+        if candidate is None:
+            for attribute in ("data-srcset", "srcset"):
+                value = image.get(attribute)
+                if isinstance(value, str):
+                    candidate = _best_srcset_url(value)
+                    if candidate:
+                        break
+
+        if candidate is None:
+            link = image.find_parent("a", href=True)
+            href = link.get("href") if link else None
+            if isinstance(href, str) and urlparse(href).path.lower().endswith(
+                IMAGE_EXTENSIONS
+            ):
+                candidate = href
+
+        if candidate is None:
+            for attribute in fallback_attributes:
+                value = image.get(attribute)
+                if isinstance(value, str) and value.strip():
+                    candidate = value.strip()
+                    break
+
+        if not candidate:
+            continue
+
+        full_url = upgrade_image_url(urljoin(page_url, candidate))
+        if full_url.startswith("data:"):
+            continue
+
+        identity = _image_identity(full_url)
+        existing_index = source_indexes.get(identity)
+        if existing_index is None:
+            source_indexes[identity] = len(image_sources)
+            image_sources.append(full_url)
+        elif _image_quality_score(full_url) > _image_quality_score(
+            image_sources[existing_index]
+        ):
+            image_sources[existing_index] = full_url
+
+    return image_sources
 
 
 def parse_rewrite_parameters(raw_parameters: str) -> RewriteParameters:
@@ -263,25 +411,14 @@ def download_images_from_url(
 
         response.raise_for_status()
 
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        img_tags = soup.find_all("img")
         pixiv_image_urls = get_pixiv_original_urls(page_url)
+        image_sources = pixiv_image_urls or extract_image_sources(
+            response.text, page_url
+        )
 
-        if not img_tags and not pixiv_image_urls:
+        if not image_sources:
             print("  [-] 该页面未找到 <img> 标签图片。")
             return
-
-        if pixiv_image_urls:
-            image_sources = pixiv_image_urls
-        else:
-            image_sources = []
-            for img in img_tags:
-                img_src = (
-                    img.get("src") or img.get("data-src") or img.get("data-original")
-                )
-                if isinstance(img_src, str):
-                    image_sources.append(img_src)
 
         img_count = 0
 
@@ -294,22 +431,12 @@ def download_images_from_url(
                 continue
 
             # ==========================
-            # 2. 转换成绝对 URL
+            # 2. 图片地址已经在提取阶段转成绝对 URL
             # ==========================
 
-            full_img_url = urljoin(page_url, img_src)
+            original_img_url = img_src
 
-            # 排除 base64
-            if full_img_url.startswith("data:"):
-                continue
-
-            # ==========================
-            # 3. ⭐ 这里才修改图片 URL
-            # ==========================
-
-            original_img_url = full_img_url
-
-            download_url = add_query_parameters(full_img_url, rewrite_parameters)
+            download_url = add_query_parameters(original_img_url, rewrite_parameters)
 
             print("\n  原始图片:")
             print(f"    {original_img_url}")
@@ -321,7 +448,7 @@ def download_images_from_url(
                 print("  使用原始链接")
 
             # ==========================
-            # 4. 获取文件名
+            # 3. 获取文件名
             # ==========================
 
             parsed_path = urlparse(download_url).path
@@ -346,7 +473,7 @@ def download_images_from_url(
                 filename = f"image_{img_count + 1}.jpg"
 
             # ==========================
-            # 5. 防止重名
+            # 4. 防止重名
             # ==========================
 
             file_path = os.path.join(save_folder, filename)
@@ -359,7 +486,7 @@ def download_images_from_url(
                 counter += 1
 
             # ==========================
-            # 6. 下载真正的图片
+            # 5. 下载真正的图片
             # ==========================
 
             print(f"  --> 下载图片: {download_url}")

@@ -3,6 +3,8 @@ import unittest
 from do import (
     add_query_parameters,
     build_pixiv_original_urls,
+    extract_image_sources,
+    upgrade_image_url,
     parse_rewrite_parameters,
     prompt_url_rewrite,
 )
@@ -87,6 +89,95 @@ class PixivImageTests(unittest.TestCase):
             [
                 "https://i.pximg.net/img-original/img/2026/09/21/21/17/48/149940075_p0.jpg",
                 "https://i.pximg.net/img-original/img/2026/09/21/21/17/48/149940075_p1.jpg",
+            ],
+        )
+
+
+class GenericImageSourceTests(unittest.TestCase):
+    def test_prefers_high_quality_attributes_and_largest_srcset_candidate(self):
+        html = """
+        <a href="/images/photo-original.jpg">
+            <img src="/images/photo-thumb.jpg"
+                 data-original="/images/photo-medium.jpg"
+                 data-full="/images/photo-full.jpg"
+                 srcset="/images/photo-small.jpg 400w, /images/photo-large.jpg 1600w">
+        </a>
+        """
+
+        result = extract_image_sources(html, "https://example.com/gallery")
+
+        self.assertEqual(result, ["https://example.com/images/photo-full.jpg"])
+
+    def test_falls_back_to_src_when_no_high_quality_candidate_exists(self):
+        html = '<img src="/images/photo-thumb.jpg">'
+
+        result = extract_image_sources(html, "https://example.com/gallery")
+
+        self.assertEqual(result, ["https://example.com/images/photo-thumb.jpg"])
+
+    def test_uses_largest_srcset_candidate_when_no_explicit_original_exists(self):
+        html = """
+        <img src="/images/photo-thumb.jpg"
+             srcset="/images/photo-small.jpg 400w, /images/photo-large.jpg 1600w">
+        """
+
+        result = extract_image_sources(html, "https://example.com/gallery")
+
+        self.assertEqual(result, ["https://example.com/images/photo-large.jpg"])
+
+    def test_uses_image_link_when_thumbnail_is_wrapped_by_original_url(self):
+        html = """
+        <a href="/images/photo-original.jpg">
+            <img src="/images/photo-thumb.jpg">
+        </a>
+        """
+
+        result = extract_image_sources(html, "https://example.com/gallery")
+
+        self.assertEqual(result, ["https://example.com/images/photo-original.jpg"])
+
+    def test_upgrades_note_image_to_the_click_quality_variant(self):
+        image_url = (
+            "https://assets.st-note.com/img/1763820256-abc.jpg?width=1200"
+        )
+
+        result = upgrade_image_url(image_url)
+
+        self.assertEqual(
+            result,
+            "https://assets.st-note.com/img/1763820256-abc.jpg?"
+            "width=4000&height=4000&fit=bounds&format=jpg&quality=90",
+        )
+
+    def test_deduplicates_note_size_variants_after_upgrading(self):
+        html = """
+        <img src="https://assets.st-note.com/img/photo.jpg?width=400">
+        <img src="https://assets.st-note.com/img/photo.jpg?width=1200">
+        """
+
+        result = extract_image_sources(html, "https://note.com/example")
+
+        self.assertEqual(
+            result,
+            [
+                "https://assets.st-note.com/img/photo.jpg?"
+                "width=4000&height=4000&fit=bounds&format=jpg&quality=90"
+            ],
+        )
+
+    def test_keeps_only_highest_note_variant_for_same_image_path(self):
+        html = """
+        <img src="https://assets.st-note.com/production/uploads/images/avatar.jpg?width=60">
+        <img src="https://assets.st-note.com/production/uploads/images/avatar.jpg?width=600">
+        <img src="https://assets.st-note.com/production/uploads/images/avatar.jpg?width=80&height=80">
+        """
+
+        result = extract_image_sources(html, "https://note.com/example")
+
+        self.assertEqual(
+            result,
+            [
+                "https://assets.st-note.com/production/uploads/images/avatar.jpg?width=600"
             ],
         )
 

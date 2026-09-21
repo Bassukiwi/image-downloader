@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md)
 
-A small Python utility that extracts image URLs from webpage HTML and downloads the images locally. Image URL query rewriting is optional and disabled by default.
+A small Python utility that extracts image URLs from webpage HTML and downloads the images locally. For regular websites, it prefers original/high-resolution candidates such as `data-full`, `data-hires`, `srcset`, or an image link, and falls back to `src` thumbnails only when no better candidate is available. For note.com images, it uses the CDN parameters used by the image-click high-resolution view (up to 4000 pixels, quality 90) and keeps only the highest-quality variant for each resource path. Image URL query rewriting is optional and disabled by default.
 
 ## Requirements
 
