@@ -92,8 +92,9 @@ rebel.xml
 description.md
 .superpowers/
 docs/superpowers/plans/
+docs/superpowers/
 docs/architecture/client-briefing-en.md
-
+framer-blog-import.csv
 
 # ==========================================
 # AI 工具本地状态与日志（禁止上传）

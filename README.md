@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md)
 
-A small Python utility that extracts image URLs from webpage HTML and downloads the images locally. It also updates the image URL's `caw` query parameter to the configured target width.
+A small Python utility that extracts image URLs from webpage HTML and downloads the images locally. Image URL query rewriting is optional and disabled by default.
 
 ## Requirements
 
@@ -49,6 +49,8 @@ URL>
 
 URLs are extracted, cleaned, and de-duplicated automatically. Invalid text is ignored. Downloaded images are saved in the `downloaded_images` directory.
 
+Before downloading, the program asks whether to modify image URL query parameters. Press Enter or choose `n` to keep the original image URLs. Choose `y` to enter parameters such as `caw=1920&format=webp`; existing parameters with the same names are replaced and new parameters are appended.
+
 ## Run with URLs in the source file
 
 The original script remains available for fixed input in `RAW_TEXT`:
@@ -64,7 +66,6 @@ Edit `RAW_TEXT` in `do.py` before running this mode. It also supports multiple U
 Adjust these values near the top of `do.py` when needed:
 
 - `SAVE_DIR`: local output directory
-- `TARGET_CAW`: target image width passed as the `caw` query parameter
 - `HEADERS`: request headers used for webpage and image requests
 
 ## Troubleshooting

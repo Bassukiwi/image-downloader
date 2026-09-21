@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import datetime
 from urllib.parse import (
     parse_qsl,
     urlencode,
@@ -24,6 +25,8 @@ RAW_TEXT = """
 SAVE_DIR = "downloaded_images"
 
 TARGET_CAW = 3840
+
+RewriteParameters = list[tuple[str, str]]
 
 # 请求头
 HEADERS = {
@@ -64,6 +67,161 @@ def extract_urls(raw_input: str) -> list:
     return urls
 
 
+def build_pixiv_original_urls(page_url: str, metadata: dict) -> list[str]:
+    """Build all original Pixiv image URLs from artwork metadata."""
+
+    artwork_id = str(metadata.get("illustId", ""))
+    page_count = metadata.get("pageCount", 0)
+    create_date = metadata.get("createDate")
+
+    if not artwork_id or not page_count:
+        return []
+
+    source_urls = []
+    original_url = (metadata.get("urls") or {}).get("original")
+    if original_url:
+        source_urls.append(original_url)
+
+    related_illustration = (metadata.get("userIllusts") or {}).get(artwork_id, {})
+    related_url = related_illustration.get("url")
+    if related_url:
+        source_urls.append(related_url)
+
+    for source_url in source_urls:
+        source_match = re.match(
+            r"^(https://i\.pximg\.net)/(?:.+/)?img/"
+            r"(?P<timestamp>\d{4}/\d{2}/\d{2}/\d{2}/\d{2}/\d{2})/"
+            r"(?P<id>\d+)_p\d+(?:_custom\d+)?(?P<extension>\.[^/?#]+)$",
+            source_url,
+        )
+        if source_match and source_match.group("id") == artwork_id:
+            return [
+                f"{source_match.group(1)}/img-original/img/"
+                f"{source_match.group('timestamp')}/{artwork_id}_p{page}"
+                f"{source_match.group('extension')}"
+                for page in range(int(page_count))
+            ]
+
+    if not create_date or not page_url:
+        return []
+
+    timestamp = datetime.fromisoformat(create_date).strftime("%Y/%m/%d/%H/%M/%S")
+    return [
+        f"https://i.pximg.net/img-original/img/{timestamp}/{artwork_id}_p{page}.jpg"
+        for page in range(int(page_count))
+    ]
+
+
+def get_pixiv_original_urls(page_url: str) -> list[str]:
+    """Fetch original image URLs for a Pixiv artwork page."""
+
+    parsed_url = urlparse(page_url)
+    if parsed_url.netloc not in {"pixiv.net", "www.pixiv.net"}:
+        return []
+
+    artwork_match = re.search(r"/artworks/(\d+)", parsed_url.path)
+    if not artwork_match:
+        return []
+
+    artwork_id = artwork_match.group(1)
+    api_url = f"https://www.pixiv.net/ajax/illust/{artwork_id}?lang=en"
+    api_headers = {**HEADERS, "Referer": page_url}
+
+    try:
+        response = requests.get(api_url, headers=api_headers, timeout=15)
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        return []
+
+    if payload.get("error"):
+        return []
+
+    return build_pixiv_original_urls(page_url, payload.get("body") or {})
+
+
+def parse_rewrite_parameters(raw_parameters: str) -> RewriteParameters:
+    """Parse a query string such as ``caw=1920&format=webp``."""
+
+    if not raw_parameters.strip():
+        raise ValueError("参数不能为空")
+
+    for parameter in raw_parameters.split("&"):
+        if "=" not in parameter or not parameter.split("=", 1)[0].strip():
+            raise ValueError("每个参数都必须使用 name=value 格式")
+
+    parameters = parse_qsl(raw_parameters, keep_blank_values=True)
+
+    if not parameters:
+        raise ValueError("没有找到有效参数")
+
+    return parameters
+
+
+def prompt_url_rewrite(input_fn=input) -> RewriteParameters | None:
+    """Ask whether image URL query parameters should be changed."""
+
+    while True:
+        choice = input_fn("是否修改图片链接参数？(y/n，默认 n): ").strip().lower()
+
+        if choice in {"", "n", "no", "否"}:
+            return None
+
+        if choice in {"y", "yes", "是"}:
+            while True:
+                raw_parameters = input_fn(
+                    "请输入要添加或修改的参数（例如 caw=1920&format=webp）: "
+                ).strip()
+
+                try:
+                    return parse_rewrite_parameters(raw_parameters)
+                except ValueError as error:
+                    print(f"参数格式无效：{error}")
+                    print("请重新输入。")
+
+        print("请输入 y 或 n。")
+
+
+def add_query_parameters(
+    image_url: str,
+    rewrite_parameters: RewriteParameters | None,
+) -> str:
+    """Replace or append query parameters when rewriting is enabled."""
+
+    if rewrite_parameters is None:
+        return image_url
+
+    parsed = urlparse(image_url)
+    query_params = parse_qsl(parsed.query, keep_blank_values=True)
+
+    for key, value in rewrite_parameters:
+        replaced = False
+        updated_params = []
+
+        for existing_key, existing_value in query_params:
+            if existing_key != key:
+                updated_params.append((existing_key, existing_value))
+            elif not replaced:
+                updated_params.append((key, value))
+                replaced = True
+
+        if not replaced:
+            updated_params.append((key, value))
+
+        query_params = updated_params
+
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            urlencode(query_params),
+            parsed.fragment,
+        )
+    )
+
+
 def add_caw_to_image_url(image_url: str, target_caw: int = 3840) -> str:
     """
     只对真正的图片 URL 添加/修改 caw 参数。
@@ -85,36 +243,16 @@ def add_caw_to_image_url(image_url: str, target_caw: int = 3840) -> str:
     https://example.com/a.jpg?foo=1&caw=3840
     """
 
-    parsed = urlparse(image_url)
-
-    # 解析原有 query 参数
-    query_params = parse_qsl(parsed.query, keep_blank_values=True)
-
-    # 删除原来的 caw
-    query_params = [(key, value) for key, value in query_params if key.lower() != "caw"]
-
-    # 添加新的 caw
-    query_params.append(("caw", str(target_caw)))
-
-    # 重新生成 query
-    new_query = urlencode(query_params)
-
-    # 重新组合 URL
-    return urlunparse(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            parsed.params,
-            new_query,
-            parsed.fragment,
-        )
-    )
+    return add_query_parameters(image_url, [("caw", str(target_caw))])
 
 
-def download_images_from_url(page_url: str, save_folder: str):
+def download_images_from_url(
+    page_url: str,
+    save_folder: str,
+    rewrite_parameters: RewriteParameters | None = None,
+):
     """
-    请求网页 → 找到图片 → 修改图片 URL 的 caw → 下载。
+    请求网页 → 找到图片 → 按需修改图片 URL → 下载。
     """
 
     try:
@@ -128,19 +266,29 @@ def download_images_from_url(page_url: str, save_folder: str):
         soup = BeautifulSoup(response.text, "html.parser")
 
         img_tags = soup.find_all("img")
+        pixiv_image_urls = get_pixiv_original_urls(page_url)
 
-        if not img_tags:
+        if not img_tags and not pixiv_image_urls:
             print("  [-] 该页面未找到 <img> 标签图片。")
             return
 
+        if pixiv_image_urls:
+            image_sources = pixiv_image_urls
+        else:
+            image_sources = []
+            for img in img_tags:
+                img_src = (
+                    img.get("src") or img.get("data-src") or img.get("data-original")
+                )
+                if isinstance(img_src, str):
+                    image_sources.append(img_src)
+
         img_count = 0
 
-        for img in img_tags:
+        for img_src in image_sources:
             # ==========================
             # 1. 获取图片原始地址
             # ==========================
-
-            img_src = img.get("src") or img.get("data-src") or img.get("data-original")
 
             if not img_src:
                 continue
@@ -161,19 +309,22 @@ def download_images_from_url(page_url: str, save_folder: str):
 
             original_img_url = full_img_url
 
-            full_img_url = add_caw_to_image_url(full_img_url, TARGET_CAW)
+            download_url = add_query_parameters(full_img_url, rewrite_parameters)
 
             print("\n  原始图片:")
             print(f"    {original_img_url}")
 
-            print("  修改后:")
-            print(f"    {full_img_url}")
+            if rewrite_parameters is not None:
+                print("  修改后:")
+                print(f"    {download_url}")
+            else:
+                print("  使用原始链接")
 
             # ==========================
             # 4. 获取文件名
             # ==========================
 
-            parsed_path = urlparse(full_img_url).path
+            parsed_path = urlparse(download_url).path
 
             filename = os.path.basename(parsed_path)
 
@@ -211,25 +362,30 @@ def download_images_from_url(page_url: str, save_folder: str):
             # 6. 下载真正的图片
             # ==========================
 
-            print(f"  --> 下载图片: {full_img_url}")
+            print(f"  --> 下载图片: {download_url}")
 
-            img_res = requests.get(full_img_url, headers=HEADERS, timeout=15)
+            try:
+                image_headers = {**HEADERS, "Referer": page_url}
+                img_res = requests.get(download_url, headers=image_headers, timeout=15)
+                img_res.raise_for_status()
+            except requests.RequestException as error:
+                print(f"  [!] 图片下载失败: {type(error).__name__}: {error}")
+                continue
 
-            if img_res.status_code == 200:
+            try:
                 with open(file_path, "wb") as f:
                     f.write(img_res.content)
+            except OSError as error:
+                print(f"  [!] 图片保存失败: {type(error).__name__}: {error}")
+                continue
 
-                img_count += 1
-
-                print(f"  [✓] 保存: {file_path}")
-
-            else:
-                print(f"  [!] 图片下载失败: HTTP {img_res.status_code}")
+            img_count += 1
+            print(f"  [✓] 保存: {file_path}")
 
         print(f"\n  [✓] 页面处理完成，成功下载 {img_count} 张图片。")
 
-    except Exception as e:
-        print(f"  [!] 处理页面失败: {e}")
+    except (OSError, requests.RequestException) as error:
+        print(f"  [!] 处理页面失败: {type(error).__name__}: {error}")
 
 
 def main():
@@ -247,6 +403,8 @@ def main():
 
         return
 
+    rewrite_parameters = prompt_url_rewrite()
+
     print(f"=== 成功识别 {len(cleaned_urls)} 个网址 ===")
 
     for idx, url in enumerate(cleaned_urls, start=1):
@@ -261,7 +419,7 @@ def main():
     for idx, url in enumerate(cleaned_urls, start=1):
         print(f"\n进度: ({idx}/{len(cleaned_urls)})")
 
-        download_images_from_url(url, SAVE_DIR)
+        download_images_from_url(url, SAVE_DIR, rewrite_parameters)
 
     print("\n🎉 所有图片下载完成！")
 

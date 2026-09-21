@@ -4,6 +4,7 @@ from do import (
     SAVE_DIR,
     download_images_from_url,
     extract_urls,
+    prompt_url_rewrite,
 )
 
 
@@ -29,6 +30,8 @@ def main():
         print("No valid HTTP/HTTPS URLs were found.")
         return
 
+    rewrite_parameters = prompt_url_rewrite()
+
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     print(f"\nFound {len(urls)} URL(s):")
@@ -38,7 +41,7 @@ def main():
     print("\nStarting image downloads...")
     for index, url in enumerate(urls, start=1):
         print(f"\nProgress: ({index}/{len(urls)})")
-        download_images_from_url(url, SAVE_DIR)
+        download_images_from_url(url, SAVE_DIR, rewrite_parameters)
 
     print(f"\nAll downloads finished. Files are in: {SAVE_DIR}")
 
