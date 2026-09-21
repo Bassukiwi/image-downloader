@@ -4,9 +4,9 @@ from do import (
     add_query_parameters,
     build_pixiv_original_urls,
     extract_image_sources,
-    upgrade_image_url,
     parse_rewrite_parameters,
     prompt_url_rewrite,
+    upgrade_image_url,
 )
 from run import collect_urls
 
@@ -127,19 +127,99 @@ class GenericImageSourceTests(unittest.TestCase):
 
     def test_uses_image_link_when_thumbnail_is_wrapped_by_original_url(self):
         html = """
-        <a href="/images/photo-original.jpg">
-            <img src="/images/photo-thumb.jpg">
+        <a href="https://c10.patreonusercontent.com/4/patreon-media/p/post/169849950/53c4d7236cf1439ebe63e49e9779d961/eyJxIjoxMDAsIndlYnAiOjB9/1.jpg?token-hash=dRkx6zEyalAoiPPVusXPVNFO0-MJ8A8GWmaZtIRyyzg%3D&token-time=1791244800">
+            <img src="https://c10.patreonusercontent.com/4/patreon-media/p/post/169849950/53c4d7236cf1439ebe63e49e9779d961/eyJ3IjoxMDgwfQ%3D%3D/1.jpg?token-hash=Vt3O1vY9xTAmPBo8yCPtdEPltaCNOWYmt_9LvxB6HG8%3D&token-time=1791244800">
         </a>
         """
 
-        result = extract_image_sources(html, "https://example.com/gallery")
+        result = extract_image_sources(html, "https://www.patreon.com/example")
 
-        self.assertEqual(result, ["https://example.com/images/photo-original.jpg"])
+        self.assertEqual(
+            result,
+            [
+                "https://c10.patreonusercontent.com/4/patreon-media/p/post/169849950/53c4d7236cf1439ebe63e49e9779d961/eyJxIjoxMDAsIndlYnAiOjB9/1.jpg?"
+                "token-hash=dRkx6zEyalAoiPPVusXPVNFO0-MJ8A8GWmaZtIRyyzg%3D&token-time=1791244800"
+            ],
+        )
+
+    def test_finds_patreon_click_url_in_page_data_when_img_has_only_thumbnail(self):
+        html = """
+        <img src="https://c10.patreonusercontent.com/4/patreon-media/p/post/169849950/53c4d7236cf1439ebe63e49e9779d961/eyJ3IjoxMDgwfQ%3D%3D/1.jpg?token-hash=Vt3O1vY9xTAmPBo8yCPtdEPltaCNOWYmt_9LvxB6HG8%3D&amp;token-time=1791244800">
+        <script>"imageUrl":"https://c10.patreonusercontent.com/4/patreon-media/p/post/169849950/53c4d7236cf1439ebe63e49e9779d961/eyJxIjoxMDAsIndlYnAiOjB9/1.jpg?token-hash=dRkx6zEyalAoiPPVusXPVNFO0-MJ8A8GWmaZtIRyyzg%3D&amp;token-time=1791244800"</script>
+        """
+
+        result = extract_image_sources(html, "https://www.patreon.com/example")
+
+        self.assertEqual(
+            result,
+            [
+                "https://c10.patreonusercontent.com/4/patreon-media/p/post/169849950/53c4d7236cf1439ebe63e49e9779d961/eyJxIjoxMDAsIndlYnAiOjB9/1.jpg?"
+                "token-hash=dRkx6zEyalAoiPPVusXPVNFO0-MJ8A8GWmaZtIRyyzg%3D&token-time=1791244800"
+            ],
+        )
+
+    def test_recovers_patreon_click_url_when_query_ampersand_is_json_escaped(self):
+        html = r"""
+        <img src="https://c10.patreonusercontent.com/4/patreon-media/p/post/169849950/53c4d7236cf1439ebe63e49e9779d961/eyJ3IjoxMDgwfQ%3D%3D/1.jpg?token-hash=Vt3O1vY9xTAmPBo8yCPtdEPltaCNOWYmt_9LvxB6HG8%3D&amp;token-time=1791244800">
+        <script>"original":"https://c10.patreonusercontent.com/4/patreon-media/p/post/169849950/53c4d7236cf1439ebe63e49e9779d961/eyJxIjoxMDAsIndlYnAiOjB9/1.jpg?token-hash=dRkx6zEyalAoiPPVusXPVNFO0-MJ8A8GWmaZtIRyyzg%3D\u0026token-time=1791244800"</script>
+        """
+
+        result = extract_image_sources(html, "https://www.patreon.com/example")
+
+        self.assertEqual(
+            result,
+            [
+                "https://c10.patreonusercontent.com/4/patreon-media/p/post/169849950/53c4d7236cf1439ebe63e49e9779d961/eyJxIjoxMDAsIndlYnAiOjB9/1.jpg?"
+                "token-hash=dRkx6zEyalAoiPPVusXPVNFO0-MJ8A8GWmaZtIRyyzg%3D&token-time=1791244800"
+            ],
+        )
+
+    def test_skips_patreon_hash_without_token_time(self):
+        html = """
+        <img src="https://c10.patreonusercontent.com/4/patreon-media/p/post/123/abc/eyJhIjoxLCJwIjoxfQ%3D%3D/1.jpg?token-hash=abc">
+        """
+
+        result = extract_image_sources(html, "https://www.patreon.com/example")
+
+        self.assertEqual(result, [])
+
+    def test_upgrades_patreon_image_to_click_quality_variant(self):
+        image_url = "https://c10.patreonusercontent.com/4/patreon-media/p/post/123/photo.jpg?width=640"
+
+        result = upgrade_image_url(image_url)
+
+        self.assertEqual(
+            result,
+            image_url,
+        )
+
+    def test_does_not_rewrite_signed_patreon_query_parameters(self):
+        image_url = (
+            "https://c10.patreonusercontent.com/4/patreon-media/p/post/123/photo.jpg?"
+            "token-hash=abc&token-time=123"
+        )
+
+        result = add_query_parameters(image_url, [("caw", "3840")])
+
+        self.assertEqual(result, image_url)
+
+    def test_deduplicates_patreon_size_variants(self):
+        html = """
+        <img src="https://c10.patreonusercontent.com/4/patreon-media/p/post/123/photo.jpg?width=640">
+        <img src="https://c10.patreonusercontent.com/4/patreon-media/p/post/123/photo.jpg?width=2048">
+        """
+
+        result = extract_image_sources(html, "https://www.patreon.com/example")
+
+        self.assertEqual(
+            result,
+            [
+                "https://c10.patreonusercontent.com/4/patreon-media/p/post/123/photo.jpg?width=2048"
+            ],
+        )
 
     def test_upgrades_note_image_to_the_click_quality_variant(self):
-        image_url = (
-            "https://assets.st-note.com/img/1763820256-abc.jpg?width=1200"
-        )
+        image_url = "https://assets.st-note.com/img/1763820256-abc.jpg?width=1200"
 
         result = upgrade_image_url(image_url)
 

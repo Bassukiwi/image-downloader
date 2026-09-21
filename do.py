@@ -1,8 +1,12 @@
+import base64
+import json
 import os
 import re
 from datetime import datetime
+from html import unescape
 from urllib.parse import (
     parse_qsl,
+    unquote,
     urlencode,
     urljoin,
     urlparse,
@@ -29,6 +33,7 @@ TARGET_CAW = 3840
 RewriteParameters = list[tuple[str, str]]
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".avif")
 NOTE_IMAGE_HOST = "assets.st-note.com"
+PATREON_IMAGE_SUFFIX = ".patreonusercontent.com"
 
 # 请求头
 HEADERS = {
@@ -166,10 +171,26 @@ def upgrade_image_url(image_url: str) -> str:
     """Use a site's original-image transformation when it is known."""
 
     parsed = urlparse(image_url)
-    if parsed.netloc.lower() != NOTE_IMAGE_HOST or not parsed.path.startswith(
-        "/img/"
-    ):
+    host = parsed.netloc.lower()
+    is_note_image = host == NOTE_IMAGE_HOST and parsed.path.startswith("/img/")
+    is_patreon_image = _is_patreon_image_url(image_url)
+
+    if not is_note_image and not is_patreon_image:
         return image_url
+
+    if is_patreon_image:
+        # Patreon signs the encoded path and token together. Without the
+        # page's real click URL, changing the thumbnail URL cannot produce a
+        # valid original URL.
+        return image_url
+    else:
+        query_params = [
+            ("width", "4000"),
+            ("height", "4000"),
+            ("fit", "bounds"),
+            ("format", "jpg"),
+            ("quality", "90"),
+        ]
 
     return urlunparse(
         (
@@ -177,18 +198,38 @@ def upgrade_image_url(image_url: str) -> str:
             parsed.netloc,
             parsed.path,
             parsed.params,
-            urlencode(
-                [
-                    ("width", "4000"),
-                    ("height", "4000"),
-                    ("fit", "bounds"),
-                    ("format", "jpg"),
-                    ("quality", "90"),
-                ]
-            ),
+            urlencode(query_params),
             parsed.fragment,
         )
     )
+
+
+def _is_patreon_image_url(image_url: str) -> bool:
+    """Return whether a URL is a signed Patreon media URL."""
+
+    parsed = urlparse(image_url)
+    return parsed.netloc.lower().endswith(PATREON_IMAGE_SUFFIX) and "/patreon-media/" in parsed.path
+
+
+def _patreon_transform(path: str) -> tuple[int, dict] | None:
+    """Decode the signed image-transform segment in a Patreon path."""
+
+    for index, segment in enumerate(path.split("/")):
+        encoded = unquote(segment)
+        if len(encoded) < 8:
+            continue
+
+        try:
+            padding = "=" * (-len(encoded) % 4)
+            payload = base64.urlsafe_b64decode(encoded + padding)
+            transform = json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+
+        if isinstance(transform, dict) and {"w", "q", "webp", "a", "p"} & transform.keys():
+            return index, transform
+
+    return None
 
 
 def _image_identity(image_url: str) -> str:
@@ -196,15 +237,24 @@ def _image_identity(image_url: str) -> str:
 
     parsed = urlparse(image_url)
     if parsed.netloc.lower() == NOTE_IMAGE_HOST:
-        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        identity_path = parsed.path
+    elif parsed.netloc.lower().endswith(PATREON_IMAGE_SUFFIX):
+        path_parts = parsed.path.split("/")
+        transform = _patreon_transform(parsed.path)
+        if transform:
+            path_parts.pop(transform[0])
+        identity_path = "/".join(path_parts)
+    else:
+        return image_url
 
-    return image_url
+    return urlunparse((parsed.scheme, parsed.netloc, identity_path, "", "", ""))
 
 
 def _image_quality_score(image_url: str) -> tuple[float, float, float]:
     """Score known CDN variants by dimensions first, then quality."""
 
-    query = dict(parse_qsl(urlparse(image_url).query, keep_blank_values=True))
+    parsed = urlparse(image_url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
 
     def number(name: str) -> float:
         try:
@@ -216,7 +266,41 @@ def _image_quality_score(image_url: str) -> tuple[float, float, float]:
     height = number("height")
     quality = number("quality")
     area = width * height if width and height else width or height
-    return max(width, height), area, quality
+
+    transform = _patreon_transform(parsed.path)
+    if transform:
+        values = transform[1]
+        if "q" in values:
+            return 2, float(values.get("q", 0)), float(values.get("webp") == 0)
+        if "w" in values:
+            return 1, float(values.get("w", 0)), 0
+
+    return 0, max(width, height), max(area, quality)
+
+
+def _has_incomplete_patreon_token(image_url: str) -> bool:
+    """Identify Patreon URLs that contain a hash but no expiry timestamp."""
+
+    if not _is_patreon_image_url(image_url):
+        return False
+
+    query = dict(parse_qsl(urlparse(image_url).query, keep_blank_values=True))
+    return bool(query.get("token-hash")) and not query.get("token-time")
+
+
+_EMBEDDED_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\/")
+
+
+def _decode_embedded_page_data(html: str) -> str:
+    """Decode HTML entities and JSON string escapes used in page payloads."""
+
+    def replace(match: re.Match[str]) -> str:
+        hex_value = match.group(1)
+        if hex_value:
+            return chr(int(hex_value, 16))
+        return "/"
+
+    return _EMBEDDED_ESCAPE_RE.sub(replace, unescape(html))
 
 
 def extract_image_sources(html: str, page_url: str) -> list[str]:
@@ -237,44 +321,72 @@ def extract_image_sources(html: str, page_url: str) -> list[str]:
     fallback_attributes = ("data-src", "data-lazy-src", "src")
 
     for image in soup.find_all("img"):
-        candidate = None
+        candidates = []
 
         for attribute in quality_attributes:
             value = image.get(attribute)
             if isinstance(value, str) and value.strip():
-                candidate = value.strip()
-                break
+                candidates.append(value.strip())
 
-        if candidate is None:
-            for attribute in ("data-srcset", "srcset"):
-                value = image.get(attribute)
-                if isinstance(value, str):
-                    candidate = _best_srcset_url(value)
-                    if candidate:
-                        break
+        for attribute in ("data-srcset", "srcset"):
+            value = image.get(attribute)
+            if isinstance(value, str):
+                candidate = _best_srcset_url(value)
+                if candidate:
+                    candidates.append(candidate)
 
-        if candidate is None:
-            link = image.find_parent("a", href=True)
-            href = link.get("href") if link else None
-            if isinstance(href, str) and urlparse(href).path.lower().endswith(
-                IMAGE_EXTENSIONS
-            ):
-                candidate = href
+        link = image.find_parent("a", href=True)
+        href = link.get("href") if link else None
+        if isinstance(href, str) and urlparse(href).path.lower().endswith(
+            IMAGE_EXTENSIONS
+        ):
+            candidates.append(href)
 
-        if candidate is None:
-            for attribute in fallback_attributes:
-                value = image.get(attribute)
-                if isinstance(value, str) and value.strip():
-                    candidate = value.strip()
-                    break
+        for attribute in fallback_attributes:
+            value = image.get(attribute)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
 
-        if not candidate:
+        if not candidates:
             continue
 
-        full_url = upgrade_image_url(urljoin(page_url, candidate))
-        if full_url.startswith("data:"):
+        candidate_urls = [
+            upgrade_image_url(urljoin(page_url, candidate)) for candidate in candidates
+        ]
+        candidate_urls = [
+            candidate
+            for candidate in candidate_urls
+            if not candidate.startswith("data:")
+            and not _has_incomplete_patreon_token(candidate)
+        ]
+        if not candidate_urls:
             continue
 
+        full_url = max(candidate_urls, key=_image_quality_score)
+
+        identity = _image_identity(full_url)
+        existing_index = source_indexes.get(identity)
+        if existing_index is None:
+            source_indexes[identity] = len(image_sources)
+            image_sources.append(full_url)
+        elif _image_quality_score(full_url) > _image_quality_score(
+            image_sources[existing_index]
+        ):
+            image_sources[existing_index] = full_url
+
+    # Some Patreon pages keep the click-through URL in serialized page data
+    # instead of the image's parent link. Include those signed candidates too.
+    # The original query string often uses JSON escapes such as \u0026 for '&'.
+    page_data = _decode_embedded_page_data(html)
+    patreon_urls = re.findall(
+        r"https?://[\w.-]*patreonusercontent\.com/[^\s\"'<>\\]+",
+        page_data,
+        flags=re.IGNORECASE,
+    )
+    for candidate in patreon_urls:
+        full_url = upgrade_image_url(urljoin(page_url, candidate.rstrip(".,;")))
+        if _has_incomplete_patreon_token(full_url):
+            continue
         identity = _image_identity(full_url)
         existing_index = source_indexes.get(identity)
         if existing_index is None:
@@ -336,7 +448,7 @@ def add_query_parameters(
 ) -> str:
     """Replace or append query parameters when rewriting is enabled."""
 
-    if rewrite_parameters is None:
+    if rewrite_parameters is None or _is_patreon_image_url(image_url):
         return image_url
 
     parsed = urlparse(image_url)
